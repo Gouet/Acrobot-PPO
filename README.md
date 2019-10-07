@@ -2,7 +2,7 @@
 
 Acrobot from GYM : https://gym.openai.com/
 
-Using DDPG : https://arxiv.org/pdf/1707.06347.pdf
+Using PPO : https://arxiv.org/pdf/1707.06347.pdf
 
 Tensorflow 1.13.1
 
