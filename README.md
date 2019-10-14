@@ -1,3 +1,7 @@
+# Youtube Video
+
+https://www.youtube.com/watch?v=H_qs8zOL2ao
+
 # Acrobot-PPO
 
 Acrobot from GYM : https://gym.openai.com/
