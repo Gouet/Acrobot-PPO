@@ -8,15 +8,30 @@ tf.enable_eager_execution()
 import os
 import cv2
 import matplotlib.pylab as plt
+import env_wrapper
+import rollout
 
 #Hyper params:
-lr               = 0.0003
-num_steps        = 1000
-mini_batch_size  = 64
-ppo_epochs       = 10
-threshold_reward = -200
-time_horizon = 2048
+TRAIN_MODE = False
+NUM_ACTION = 3
+ENV_GAME_NAME = 'Acrobot-v1'
+VALUE_FACTOR = 1.0
+ENTROPY_FACTOR = 0.0
+EPSILON = 0.2
+LR = 3e-4
+LR_DECAY = 'constant'
+GRAD_CLIP = 0.5
+TIME_HORIZON = 2048
+BATCH_SIZE = 64
+GAMMA = 0.99
+LAM = 0.95
+EPOCH = 10
+ACTORS = 1
+FINAL_STEP = 10e6
+print(FINAL_STEP)
+STATE_SHAPE = [6, 1]
 
+print(tf.__version__)
 try:  
     os.mkdir('./saved')
 except OSError:  
@@ -24,18 +39,29 @@ except OSError:
 else:  
     print ("Successfully created the directory")
 
-print(tf.__version__)
-env = gym.make('Acrobot-v1')
+def _process_obs(obs):
+    return np.reshape(obs, (1, 6, 1))
+
+def _clip_reward(reward):
+    return reward / 10.0
+
+def _end_episode(episode, data, max_step, episode_step):
+    global_step.assign_add(1)
+    print('Episode: ', episode, ' entropy: ', data[0] / float(episode_step), ' reward', data[1], ' global_step: ', max_step, ' episode_step: ', episode_step)
+    with writer.as_default(), tf.contrib.summary.always_record_summaries():
+        tf.contrib.summary.scalar("entropy", data[0] / float(episode_step))
+        tf.contrib.summary.scalar("reward", data[1])
+        tf.contrib.summary.scalar("episode_step", episode_step)
+        
+
+envs = env_wrapper.EnvWrapper(ENV_GAME_NAME, ACTORS, update_obs=_process_obs, update_reward=_clip_reward, end_episode=_end_episode)
+rollouts = [rollout.Rollout() for _ in range(ACTORS)]
 
 global ep_ave_max_q_value
 ep_ave_max_q_value = 0
 global total_reward
 total_reward = 0
 
-def _process_obs(obs):
-    obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-    obs = cv2.resize(obs, (84, 84), interpolation=cv2.INTER_AREA)
-    return obs[None, :, :, None] / 256 # Shape (84, 84, 1)
 
 def create_tensorboard():
     global_step = tf.train.get_or_create_global_step()
@@ -45,153 +71,113 @@ def create_tensorboard():
     writer.set_as_default()
     return global_step, writer
 
-def to_grayscale(im, weights = np.c_[0.2989, 0.5870, 0.1140]):
-    """
-    Transforms a colour image to a greyscale image by
-    taking the mean of the RGB values, weighted
-    by the matrix weights
-    """
-    tile = np.tile(weights, reps=(im.shape[0],im.shape[1],1))
-    return np.sum(tile * im, axis=2) / 256.0
-
-
-def make_epsilon_greedy_policy(model, nA):
-    def policy_fn(observation, epsilon):
-        A = np.ones(nA, dtype=float) * epsilon / nA
-        dist, value = model.predict(observation)
-        best_action = np.argmax(dist)
-        A[best_action] += (1.0 - epsilon)
-        return A, value
-    return policy_fn
-
-def plti(im, h=8, **kwargs):
-    """
-    Helper function to plot an image.
-    """
-    y = im.shape[0]
-    x = im.shape[1]
-    w = (y/x) * h
-    plt.figure(figsize=(w,h))
-    plt.imshow(im, interpolation="none", **kwargs)
-    plt.axis('off')
-    plt.show()
-
 global global_step
 global_step, writer = create_tensorboard()
-actorCritic = ppo.ActorCritic(3, lr)
-actorCriticOld = ppo.ActorCritic(3, lr)
+actorCritic = ppo.ActorCritic(NUM_ACTION, LR, EPSILON, FINAL_STEP, STATE_SHAPE)
+actorCriticOld = ppo.ActorCritic(NUM_ACTION, LR, EPSILON, FINAL_STEP, STATE_SHAPE)
 
 try:
     actorCriticOld.load()
 except Exception as e:
     print('failed to load')
 
-epsilon_start = 1.0
-epsilon_end = 0.1
-epsilon_decay_steps = 50000
-epsilons = np.linspace(epsilon_start, epsilon_end, epsilon_decay_steps)
-policy = make_epsilon_greedy_policy(actorCriticOld.model, 3)
-episode = 0
-opti_step = -1
-log_probs = []
-values    = []
-states    = []
-actions   = []
-rewards   = []
-masks     = []
+def train(next_value):
+    values = []
+    rewards = []
+    masks = []
+    actions = []
+    log_probs = []
+    states = []
 
-for episode in range(10000):
-    global_step.assign_add(1)
+    for rollout in rollouts:
+        obs_d, actions_d, rewards_d, values_d, log_probs_d, terminals_d = rollout.get_storage()
+        actions.append(actions_d)
+        states.append(obs_d)
+        rewards.append(rewards_d)
+        values.append(values_d)
+        log_probs.append(log_probs_d)
+        masks.append(terminals_d)
 
-    obs = env.reset()
-    obs = np.reshape(obs, (1, 6, 1))
-    done = False
-    j = 0
-    ep_ave_max_q_value = 0
-    total_reward = 0
+    values = np.array(values)
+    rewards = np.array(rewards)
+    masks = np.array(masks)
+    actions = np.array(actions)
+    log_probs = np.array(log_probs)
+    states = np.array(states)
 
-    entropy = 0
+    returns = ppo.compute_returns(rewards, next_value, masks, GAMMA)
 
-    epsilon = 1
-    while not done and j < num_steps:
-        if episode % 10 == 0:
-            env.render()
+    advantage = ppo.compute_gae(rewards, values, next_value, masks, GAMMA, LAM)
 
-        dist, value = actorCriticOld.model.predict(obs)
-        distCat = tf.distributions.Categorical(probs=dist)
+    advantage = (advantage - np.mean(advantage)) / np.std(advantage)
+
+
+    indices = np.random.permutation(range(TIME_HORIZON))
+    states = states[:, indices]
+    actions = actions[:, indices]
+    log_probs = log_probs[:, indices]
+    returns = returns[:, indices]
+    advantage = advantage[:, indices]
+    masks = masks[:, indices]
+
+    loss = ppo.update(actorCritic, TIME_HORIZON, EPOCH, BATCH_SIZE, states, actions, log_probs, returns, advantage, GRAD_CLIP, VALUE_FACTOR, ENTROPY_FACTOR, STATE_SHAPE)
+    actorCriticOld.hard_copy(actorCritic.model.trainable_variables)
+
+    for rollout in rollouts:
+        rollout.flush()
+
+    pass
+
+t = 0
+batch_obs = envs.reset()
+update_episode = 0
+
+while True:
+    if not TRAIN_MODE:
+        envs.render(0)
+    
+    actions_t = []
+    dists_t = []
+    values_t = []
+    dist_cat_t = []
+    entropy_t = []
+
+    for stack in batch_obs:
+        dist, value = actorCriticOld.model.predict(stack)
+        distCat = tf.distributions.Categorical(probs=tf.nn.softmax(dist))
         action = distCat.sample(1)[0]
-        obs2, reward, done, info = env.step(action)
-        obs2 = np.reshape(obs2, (1,6,1))
+        entropy_t.append(distCat.entropy())
+        actions_t.append(action)
+        dists_t.append(dist)
+        dist_cat_t.append(distCat)
+        values_t.append(value)
 
-        #obs2 = _process_obs(obs2)
+    obs2s_t, rewards_t, dones_t = envs.step(actions_t)
 
-        total_reward += reward
-        log_prob = distCat.log_prob(action)
-        entropy += tf.reduce_mean(distCat.entropy())
-        log_probs.append(log_prob)
-        values.append(value[0])
-        rewards.append([reward / 10])
-        masks.append([1 - done])
-        
-        states.append(obs[0,:])
-        actions.append(action)
+    for i in range(ACTORS):
+        data = envs.get_variables_at_index(i)
+        if len(data) < 2:
+            data = [0, 0]
+        envs.add_variables_at_index(i, [np.mean(entropy_t[i]) + data[0], rewards_t[i] + data[1]])
 
-        #stack = stack[:,:,:,1:]
-        #stack = np.concatenate([stack, obs2], axis=-1)
+    if t > 0 and (t / ACTORS) % TIME_HORIZON == 0 and TRAIN_MODE:
+        next_values = np.reshape(values_t, [-1])
+        train(next_values)
 
-        obs = obs2
-        j += 1
-        opti_step += 1
-        if opti_step > 0 and (opti_step / 1) % time_horizon == 0:
-
-            values = np.array(values)
-            rewards = np.array(rewards)
-            masks = np.array(masks)
-            actions = np.array(actions)
-            log_probs = np.array(log_probs)
-            states = np.array(states)
-
-            values = np.reshape(values, (1, values.shape[0]))
-            rewards = np.reshape(rewards, (1, rewards.shape[0]))
-            masks = np.reshape(masks, (1, masks.shape[0]))
-            actions = np.reshape(actions, (1, actions.shape[0]))
-            log_probs = np.reshape(log_probs, (1, log_probs.shape[0]))
-            states = np.expand_dims(states, axis=0)
-
-            _, next_value = actorCritic.model.predict(obs)
-            returns = ppo.compute_returns(rewards, next_value[0], masks, 0.99)
-
-            advantage = ppo.compute_gae(rewards, values, next_value[0], masks, 0.99, 0.95)
-
-            advantage = (advantage - np.mean(advantage)) / np.std(advantage)
-
-            indices = np.random.permutation(range(time_horizon))
-            states = states[:, indices]
-            actions = actions[:, indices]
-            log_probs = log_probs[:, indices]
-            returns = returns[:, indices]
-            advantage = advantage[:, indices]
-            masks = masks[:, indices]
-
-            loss = ppo.update(actorCritic, ppo_epochs, mini_batch_size, states, actions, log_probs, returns, advantage, opti_step)
-            actorCriticOld.hard_copy(actorCritic.model.trainable_variables)
-
-            with writer.as_default(), tf.contrib.summary.always_record_summaries():
-                tf.contrib.summary.scalar("loss", loss[0] / float(j))
-
+        if update_episode % 50 == 0:
             actorCritic.save()
+        update_episode += 1
 
-            log_probs = []
-            values    = []
-            states    = []
-            actions   = []
-            rewards   = []
-            masks     = []
+    if TRAIN_MODE:
+        for i, rollout in enumerate(rollouts):
+            log_prob = dist_cat_t[i].log_prob(actions_t[i])
+            rollout.add(batch_obs[i][0,:], actions_t[i][0], rewards_t[i], values_t[i][0][0], log_prob[0], 1 - dones_t[i])
 
-    with writer.as_default(), tf.contrib.summary.always_record_summaries():
-        tf.contrib.summary.scalar("entropy", entropy / float(j))
-        tf.contrib.summary.scalar("reward", total_reward)
-    episode += 1
-    print('TOTAL REWARD:', total_reward)
+    t += ACTORS
+    
+    for i, stack in enumerate(batch_obs):
+        batch_obs[i] = obs2s_t[i]
 
-env.close()
+    if LR_DECAY == 'linear':
+        actorCritic.decay_clip_param(t)
+        actorCritic.decay_learning_rate(t)
