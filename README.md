@@ -13,6 +13,6 @@ python train.py
 
 **Tensorboard**
 
-<img src="https://github.com/Gouet/Acrobot-PPO/blob/master/entropy.png" width="400" height="300">
+<img src="https://github.com/Gouet/Acrobot-PPO/blob/master/images/entropy.png" width="400" height="300">
 
-<img src="https://github.com/Gouet/Acrobot-PPO/blob/master/rewards.png" width="400" height="300">
+<img src="https://github.com/Gouet/Acrobot-PPO/blob/master/images/rewards.png" width="400" height="300">
